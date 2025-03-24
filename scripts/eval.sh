@@ -1,0 +1,16 @@
+torchrun --master_port=29502 \
+--nproc_per_node=4 main.py \
+--eval \
+--model suit_tiny_224 \
+--resume suit_tiny_224.pth \
+--num_workers 56 \
+--pe-type ff \
+--pe-injection concat \
+--aggregate max avg \
+--n-spix-segments 196 \
+--downsample 2 \
+--spix-method fastslic \
+--data-set IMNET \
+--data-path datasets/imagenet-1k \
+--trial_name suit_tiny_eval \
+--batch-size 256 
