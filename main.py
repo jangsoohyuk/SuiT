@@ -1,3 +1,4 @@
+# Modified for Adaptive Superpixels feature
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
 import argparse
@@ -18,10 +19,13 @@ from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
-from datasets import build_dataset
+from datasets import build_dataset, Denormalize # Added Denormalize
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD # Added for Denormalize
 from engine import train_one_epoch, evaluate
 from samplers import RASampler
 from augment import new_data_aug_generator
+# Import ParameterPredictor
+from predictor import ParameterPredictor 
 
 import suit
 
@@ -189,6 +193,19 @@ def get_args_parser():
     parser.set_defaults(use_proj=True)
 
     parser.add_argument('--trial_name', type=str, required=True)
+
+    # --- Arguments for Adaptive Superpixels Feature ---
+    parser.add_argument('--adaptive_superpixels', action='store_true',
+                        help='Enable adaptive superpixel generation using ParameterPredictor. '\
+                             'If True, ParameterPredictor is instantiated and used in the training loop.')
+    parser.add_argument('--k_min', type=int, default=50, 
+                        help='Minimum K value (number of superpixels) for ParameterPredictor output scaling.')
+    parser.add_argument('--k_max', type=int, default=400, 
+                        help='Maximum K value for ParameterPredictor output scaling.')
+    parser.add_argument('--m_min', type=int, default=1, 
+                        help='Minimum m value (compactness) for ParameterPredictor output scaling.')
+    parser.add_argument('--m_max', type=int, default=30, 
+                        help='Maximum m value for ParameterPredictor output scaling.')
     return parser
 
 
@@ -207,8 +224,14 @@ def main(args):
 
     cudnn.benchmark = True
 
+    # Build training and validation datasets
+    # args.adaptive_superpixels is passed to build_dataset to configure SpixImageFolder behavior
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
+
+    # Instantiate Denormalize transform, required for adaptive superpixel generation
+    # as superpixel algorithms often expect images in [0, 255] range.
+    denormalize_transform = Denormalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
 
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -271,7 +294,21 @@ def main(args):
         img_size=args.input_size
     )
 
-                    
+    # --- Adaptive Superpixels: ParameterPredictor Instantiation ---
+    parameter_predictor = None # Initialize to None
+    if getattr(args, 'adaptive_superpixels', False): # Check if adaptive_superpixels flag is set
+        print("INFO: Adaptive superpixels enabled. Creating ParameterPredictor.")
+        parameter_predictor = ParameterPredictor(
+            k_min=args.k_min, 
+            k_max=args.k_max, 
+            m_min=args.m_min, 
+            m_max=args.m_max
+        ).to(device) # Move predictor to the specified device
+        # The ParameterPredictor is a separate model. Its parameters need to be
+        # explicitly added to the optimizer and handled during checkpointing.
+    else:
+        print("INFO: Adaptive superpixels disabled.")
+
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -346,12 +383,30 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Add parameter_predictor parameters to the total count if it's active
+    if parameter_predictor:
+        n_parameters += sum(p.numel() for p in parameter_predictor.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
+
     if not args.unscale_lr:
         linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
         args.lr = linear_scaled_lr
-    optimizer = create_optimizer(args, model_without_ddp)
-    loss_scaler = NativeScaler()
+
+    # --- Optimizer Configuration for Adaptive Superpixels ---
+    # If adaptive superpixels are enabled, include the ParameterPredictor's parameters in the optimizer.
+    if getattr(args, 'adaptive_superpixels', False) and parameter_predictor:
+        print("INFO: Adding ParameterPredictor parameters to the optimizer.")
+        # Create a list of parameter groups for the optimizer
+        params_to_optimize = [
+            {"params": model_without_ddp.parameters()}, # Main model parameters
+            {"params": parameter_predictor.parameters()} # ParameterPredictor parameters
+        ]
+        optimizer = create_optimizer(args, params_to_optimize)
+    else:
+        # Default optimizer: only main model parameters
+        optimizer = create_optimizer(args, model_without_ddp)
+    
+    loss_scaler = NativeScaler() # For mixed precision training
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
 
@@ -375,7 +430,17 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
+        
+        # Load main model state dict
         model_without_ddp.load_state_dict(checkpoint['model'])
+        
+        # --- Adaptive Superpixels: Load ParameterPredictor state from checkpoint ---
+        if getattr(args, 'adaptive_superpixels', False) and parameter_predictor and 'parameter_predictor' in checkpoint:
+            print("INFO: Loading ParameterPredictor state from checkpoint.")
+            parameter_predictor.load_state_dict(checkpoint['parameter_predictor'])
+        elif getattr(args, 'adaptive_superpixels', False) and parameter_predictor and 'parameter_predictor' not in checkpoint:
+            print("WARNING: Adaptive superpixels enabled, but no 'parameter_predictor' state found in checkpoint.")
+        
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -385,8 +450,19 @@ def main(args):
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
         lr_scheduler.step(args.start_epoch)
+
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        # --- Evaluation Call: Pass adaptive superpixel arguments ---
+        test_stats = evaluate(
+            data_loader_val, model, device, 
+            is_suit=('suit' in args.model), # Determine if it's a SUIT model
+            # Adaptive superpixel related arguments
+            adaptive_superpixels=getattr(args, 'adaptive_superpixels', False),
+            parameter_predictor=parameter_predictor,
+            denormalize_transform=denormalize_transform,
+            args_spix_downsample=args.downsample, # Use existing args.downsample
+            args_spix_method=args.spix_method     # Use existing args.spix_method
+        )
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
@@ -401,15 +477,55 @@ def main(args):
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
-            set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
+            set_training_mode=args.train_mode, 
             args = args,
+            # --- Training Call: Pass adaptive superpixel arguments to train_one_epoch ---
+            parameter_predictor=parameter_predictor,
+            adaptive_superpixels=getattr(args, 'adaptive_superpixels', False),
+            denormalize_transform=denormalize_transform,
+            args_spix_downsample=args.downsample, # Use existing args.downsample
+            args_spix_method=args.spix_method     # Use existing args.spix_method
         )
 
         lr_scheduler.step(epoch)
         if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
+            # --- Checkpointing: Save ParameterPredictor state ---
+            checkpoint_payload = { # Data to save in the checkpoint
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'model_ema': get_state_dict(model_ema),
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+            }
+            # If adaptive superpixels are enabled, add the ParameterPredictor's state_dict
+            if getattr(args, 'adaptive_superpixels', False) and parameter_predictor:
+                print(f"INFO: Saving ParameterPredictor state in epoch {epoch} checkpoint.")
+                checkpoint_payload['parameter_predictor'] = parameter_predictor.state_dict()
+
+            checkpoint_paths = [output_dir / 'checkpoint.pth'] # Path for regular checkpoint
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
+                utils.save_on_master(checkpoint_payload, checkpoint_path)
+             
+        # --- Evaluation Call during training: Pass adaptive superpixel arguments ---
+        test_stats = evaluate(
+            data_loader_val, model, device,
+            is_suit=('suit' in args.model), # Determine if it's a SUIT model
+            # Adaptive superpixel related arguments
+            adaptive_superpixels=getattr(args, 'adaptive_superpixels', False),
+            parameter_predictor=parameter_predictor,
+            denormalize_transform=denormalize_transform,
+            args_spix_downsample=args.downsample, # Use existing args.downsample
+            args_spix_method=args.spix_method     # Use existing args.spix_method
+        )
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        
+        if max_accuracy < test_stats["acc1"]: # Check if current accuracy is the best
+            max_accuracy = test_stats["acc1"]
+            if args.output_dir:
+                # --- Best Checkpointing: Save ParameterPredictor state ---
+                best_checkpoint_payload = { # Data to save for the best model
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
@@ -417,26 +533,15 @@ def main(args):
                     'model_ema': get_state_dict(model_ema),
                     'scaler': loss_scaler.state_dict(),
                     'args': args,
-                }, checkpoint_path)
-             
-
-        test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        
-        if max_accuracy < test_stats["acc1"]:
-            max_accuracy = test_stats["acc1"]
-            if args.output_dir:
-                checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                }
+                # If adaptive superpixels are enabled, add the ParameterPredictor's state_dict
+                if getattr(args, 'adaptive_superpixels', False) and parameter_predictor:
+                    print(f"INFO: Saving ParameterPredictor state in best checkpoint (epoch {epoch}).")
+                    best_checkpoint_payload['parameter_predictor'] = parameter_predictor.state_dict()
+                
+                checkpoint_paths = [output_dir / 'best_checkpoint.pth'] # Path for best checkpoint
                 for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'model_ema': get_state_dict(model_ema),
-                        'scaler': loss_scaler.state_dict(),
-                        'args': args,
-                    }, checkpoint_path)
+                    utils.save_on_master(best_checkpoint_payload, checkpoint_path)
             
         print(f'Max accuracy: {max_accuracy:.2f}%')
 
