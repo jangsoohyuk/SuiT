@@ -95,6 +95,16 @@ def generate_superpixels(
         # Convert assignment map to tensor and add a channel dimension (1, H_spix, W_spix)
         batch_assignments.append(torch.tensor(assignment, dtype=torch.int32).unsqueeze(0))
 
+        # Explicitly delete intermediate NumPy arrays and SLIC engine to help GC
+        del img_for_spix_normalized_cpu
+        del img_for_spix_denormalized
+        del img_for_spix_numpy
+        del img_for_spix_rescaled
+        del assignment # The NumPy array from SLIC
+        # slic_engine is minor, but can be deleted if it stores state and was created (fastslic path)
+        if 'slic_engine' in locals():
+            del slic_engine
+
     # Stack all assignment maps into a single batch tensor (N, 1, H_spix, W_spix)
     # and move to the specified device.
     return torch.stack(batch_assignments).to(device)
