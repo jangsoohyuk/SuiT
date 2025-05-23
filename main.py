@@ -23,9 +23,8 @@ from engine import train_one_epoch, evaluate
 from samplers import RASampler
 from augment import new_data_aug_generator
 
-# import suit # Original import
-from models import suit_adaptive # Import the new adaptive models
-# By importing suit_adaptive, the models within it should be registered with timm
+import suit # Changed to import the consolidated suit.py
+# This ensures models registered in suit.py are available via timm.create_model
 
 import utils
 from torch.utils.tensorboard import SummaryWriter

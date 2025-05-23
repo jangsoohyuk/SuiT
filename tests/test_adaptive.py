@@ -10,9 +10,9 @@ except ImportError:
     SKIMAGE_AVAILABLE = False
 
 # Module imports
-from models.parameter_predictor import ParameterPredictor
-from utils.superpixels import generate_superpixels # This also imports SKIMAGE_AVAILABLE from its own scope
-from models.suit_adaptive import suit_tiny_224_adaptive, SuitAdaptive 
+from suit import ParameterPredictor # Changed
+from utils import generate_superpixels # Changed & removed comment for simplicity in diff
+from suit import suit_tiny_224_adaptive, SuitAdaptive # Changed
 
 # For mocking
 from unittest.mock import patch, MagicMock
@@ -87,12 +87,17 @@ class TestGenerateSuperpixels(unittest.TestCase):
     @unittest.skipIf(SKIMAGE_AVAILABLE, "scikit-image is available, skipping fallback test")
     def test_no_skimage_fallback(self):
         # This test runs if SKIMAGE_AVAILABLE is False (globally for the test file)
-        # or if utils.superpixels.SKIMAGE_AVAILABLE is False
+        # or if utils.SKIMAGE_AVAILABLE is False (original was utils.superpixels.SKIMAGE_AVAILABLE)
         
         # To ensure we test the fallback in generate_superpixels,
-        # we might need to patch 'utils.superpixels.SKIMAGE_AVAILABLE' to False for this test
-        original_skimage_available_in_util = utils.superpixels.SKIMAGE_AVAILABLE
-        utils.superpixels.SKIMAGE_AVAILABLE = False # Force fallback for this test
+        # we might need to patch 'utils.SKIMAGE_AVAILABLE' to False for this test
+        # This assumes utils.generate_superpixels directly uses utils.SKIMAGE_AVAILABLE
+        
+        # Store original state of SKIMAGE_AVAILABLE in utils module
+        # This requires utils module to be imported. It should be by `from utils import generate_superpixels`
+        import utils as utils_module # Import the module itself to patch its attribute
+        original_skimage_available_in_util = utils_module.SKIMAGE_AVAILABLE
+        utils_module.SKIMAGE_AVAILABLE = False # Force fallback for this test
 
         with self.assertWarns(UserWarning) if hasattr(self, 'assertWarns') else self.assertRaises(UserWarning): # Python 3.8+ for assertWarns
             # In older Python, we might need to check printed output or just expect the zeros.
@@ -106,7 +111,7 @@ class TestGenerateSuperpixels(unittest.TestCase):
         self.assertTrue(superpixels_batch.dtype == torch.int64 or superpixels_batch.dtype == torch.long)
         self.assertTrue(torch.all(superpixels_batch == 0))
 
-        utils.superpixels.SKIMAGE_AVAILABLE = original_skimage_available_in_util # Restore
+        utils_module.SKIMAGE_AVAILABLE = original_skimage_available_in_util # Restore
 
 
 class TestSuitAdaptive(unittest.TestCase):
@@ -126,7 +131,7 @@ class TestSuitAdaptive(unittest.TestCase):
         output = self.model(self.dummy_images_batch1)
         self.assertEqual(output.shape, torch.Size([1, self.num_classes]))
 
-    @patch('utils.superpixels.generate_superpixels') # Mock the actual superpixel generation
+    @patch('utils.generate_superpixels') # Mock the actual superpixel generation - CHANGED
     def test_parameter_clipping_integration(self, mock_generate_superpixels):
         # Configure the mock generate_superpixels to return a valid tensor
         # so the rest of the forward pass doesn't fail.
@@ -197,5 +202,12 @@ if __name__ == '__main__':
     # This is a bit tricky as the import happens at module level.
     # The TestGenerateSuperpixels.test_no_skimage_fallback tries to handle this for its specific case.
     print(f"SKIMAGE_AVAILABLE (for test execution): {SKIMAGE_AVAILABLE}")
-    print(f"utils.superpixels.SKIMAGE_AVAILABLE (actual used by module): {utils.superpixels.SKIMAGE_AVAILABLE}")
+    # utils.superpixels.SKIMAGE_AVAILABLE is no longer valid as utils.superpixels module is gone.
+    # We should refer to utils.SKIMAGE_AVAILABLE if needed, which is imported by `from utils import generate_superpixels`
+    # or by direct import of utils module.
+    import utils as utils_module_main # For checking SKIMAGE_AVAILABLE in main
+    if hasattr(utils_module_main, 'SKIMAGE_AVAILABLE'):
+        print(f"utils.SKIMAGE_AVAILABLE (actual used by module): {utils_module_main.SKIMAGE_AVAILABLE}")
+    else:
+        print("utils.SKIMAGE_AVAILABLE not found directly in utils module for printing.")
     unittest.main()

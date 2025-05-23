@@ -20,9 +20,10 @@ except ImportError:
     SKIMAGE_AVAILABLE = False
 
 # Module imports
-from models.parameter_predictor import ParameterPredictor
-from utils.superpixels import generate_superpixels # This also imports SKIMAGE_AVAILABLE from its own scope
-from models.suit_adaptive import suit_tiny_224_adaptive, SuitAdaptive
+from suit import ParameterPredictor # Changed
+from utils import generate_superpixels # Changed
+from suit import suit_tiny_224_adaptive, SuitAdaptive # Changed
+import utils # For accessing utils.SKIMAGE_AVAILABLE
 
 # Define typical ImageNet mean and std if needed for unnormalization
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -105,7 +106,7 @@ def compare_fixed_vs_adaptive_segmentation(image_tensor: torch.Tensor,
         print("Matplotlib or scikit-image not available. Skipping comparison plot.")
         return
     
-    if not utils.superpixels.SKIMAGE_AVAILABLE: # Check skimage specifically for generate_superpixels
+    if not utils.SKIMAGE_AVAILABLE: # Check skimage specifically for generate_superpixels - CHANGED
         print("scikit-image needed by generate_superpixels is not available. Skipping comparison.")
         return
 
@@ -166,7 +167,7 @@ def compare_fixed_vs_adaptive_segmentation(image_tensor: torch.Tensor,
 if __name__ == '__main__':
     if not MATPLOTLIB_AVAILABLE or not SKIMAGE_AVAILABLE:
         print("Matplotlib or scikit-image is not available. Skipping example usage.")
-    elif not utils.superpixels.SKIMAGE_AVAILABLE: # Check skimage for generate_superpixels
+    elif not utils.SKIMAGE_AVAILABLE: # Check skimage for generate_superpixels - CHANGED
         print("scikit-image (for generate_superpixels) not available. Skipping example usage that needs it.")
     else:
         print("Running visualization examples...")
