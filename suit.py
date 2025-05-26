@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 import os
-import gdown
+# import gdown # Removed as it's not used by SuitAdaptive logic
 
 import torch.nn as nn
 from torch.nn.functional import interpolate, scaled_dot_product_attention
@@ -17,8 +17,33 @@ from einops import repeat, rearrange
 from torch_scatter import scatter_max, scatter_mean, scatter_sum, scatter_softmax, scatter_min
 from torch_scatter.composite import scatter_std
 
+# Inlined ParameterPredictor class definition (from models/parameter_predictor.py)
+class ParameterPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        self.fc = nn.Linear(64, 2)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)  # Flatten the tensor
+        params = self.fc(x)
+        return {
+            "num_superpixels": params[:, 0],
+            "compactness": params[:, 1]
+        }
+
+# Import generate_superpixels from the updated top-level utils.py
+from utils import generate_superpixels 
+
 __all__ = [
-    'suit_tiny_224', 'suit_small_224', 'suit_base_224', 'suit_base_dino'
+    'suit_tiny_224_adaptive', 'suit_small_224_adaptive', 'suit_base_224_adaptive', 'suit_base_dino_adaptive'
 ]
 
 # Poisitional Encoding proposed in Vaswani et al., https://arxiv.org/abs/1706.03762
@@ -182,7 +207,7 @@ class EmptyMaskingAttention(nn.Module):
             return x
 
 
-class SuperpixelVisionTransformer(VisionTransformer):
+class SuitAdaptive(VisionTransformer):
     def __init__(self, *args, **kwargs):
         self.pe_type = kwargs.get('pe_type', 'ff')
         self.pe_injection = kwargs.get('pe_injection', 'concat')
@@ -191,8 +216,17 @@ class SuperpixelVisionTransformer(VisionTransformer):
         self.base_dim = kwargs.get('base_dim', 96)
         self.embed_dim = kwargs.get('embed_dim', 384)
         self.use_proj = kwargs.get('use_proj', True)
+        # Instantiate ParameterPredictor
+        self.parameter_predictor = ParameterPredictor()
         # filter keywords
+        # Remove n_spix_segments, compactness if they were part of kwargs, as they are now predicted.
+        # Assuming they were not explicit args to SuperpixelVisionTransformer's __init__ but rather general **kwargs
+        # or handled by a config object not directly visible here.
+        # If they were specific named arguments, they would need to be explicitly removed from the method signature
+        # and from being passed to super().__init__ if VisionTransformer doesn't expect them.
         suit_only_keywords = ['pe_type', 'pe_injection', 'downsample', 'aggregate', 'base_dim', 'use_proj']
+        # Add any superpixel specific args that are now redundant to keywords_to_filter
+        # e.g., 'n_spix_segments', 'compactness' if they were passed in kwargs
         old_timm_keywords = ['pretrained_cfg', 'pretrained_cfg_overlay', 'cache_dir']
         keywords_to_filter = suit_only_keywords + old_timm_keywords
         for k in keywords_to_filter:
@@ -351,7 +385,30 @@ class SuperpixelVisionTransformer(VisionTransformer):
         x = self.norm(x)
         return x
 
-    def forward(self, x: torch.Tensor, spix_label: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Predict superpixel parameters
+        params = self.parameter_predictor(x)
+        K_pred = params["num_superpixels"]
+        m_pred = params["compactness"]
+
+        # Normalize and clip parameters
+        # K should be integer for slic, generate_superpixels handles .item() and int()
+        K = torch.clamp(K_pred, min=50, max=1000) 
+        m = torch.clamp(m_pred, min=1, max=40)
+
+        # Generate superpixels
+        # generate_superpixels expects K and m to be tensors of shape [B]
+        # If K_pred, m_pred are [B, 1], squeeze them. If they are already [B], it's fine.
+        # Assuming ParameterPredictor outputs [B, 1] or [B] for each.
+        if K.dim() > 1 and K.shape[1] == 1:
+            K = K.squeeze(1)
+        if m.dim() > 1 and m.shape[1] == 1:
+            m = m.squeeze(1)
+            
+        spix_label = generate_superpixels(x, K, m)
+        # Add channel dimension to spix_label to match expected shape [B, 1, H, W] in forward_features
+        spix_label = spix_label.unsqueeze(1)
+
         x = self.forward_features(x, spix_label)
         x = self.forward_head(x)
         return x
@@ -386,7 +443,17 @@ class SuperpixelVisionTransformer(VisionTransformer):
         if reset_coords:
             self.make_coords(img_size=img_size)
     
-    def get_last_selfattention(self, x, spix_label):
+    def get_last_selfattention(self, x: torch.Tensor) -> torch.Tensor:
+        # Predict superpixel parameters
+        params = self.parameter_predictor(x)
+        K_pred = params["num_superpixels"]
+        m_pred = params["compactness"]
+        K = torch.clamp(K_pred, min=50, max=1000)
+        m = torch.clamp(m_pred, min=1, max=40)
+        if K.dim() > 1 and K.shape[1] == 1: K = K.squeeze(1)
+        if m.dim() > 1 and m.shape[1] == 1: m = m.squeeze(1)
+        spix_label = generate_superpixels(x, K, m).unsqueeze(1)
+
         x, mask = self.prepare_tokens(x, spix_label) # patch_embed and _pos_embed in once
         x = self.patch_drop(x)
         x = self.norm_pre(x)
@@ -399,7 +466,17 @@ class SuperpixelVisionTransformer(VisionTransformer):
         
         return attn
 
-    def get_selfattentions(self, x, spix_label):
+    def get_selfattentions(self, x: torch.Tensor) -> torch.Tensor:
+        # Predict superpixel parameters
+        params = self.parameter_predictor(x)
+        K_pred = params["num_superpixels"]
+        m_pred = params["compactness"]
+        K = torch.clamp(K_pred, min=50, max=1000)
+        m = torch.clamp(m_pred, min=1, max=40)
+        if K.dim() > 1 and K.shape[1] == 1: K = K.squeeze(1)
+        if m.dim() > 1 and m.shape[1] == 1: m = m.squeeze(1)
+        spix_label = generate_superpixels(x, K, m).unsqueeze(1)
+
         x, mask = self.prepare_tokens(x, spix_label) # patch_embed and _pos_embed in once
         x = self.patch_drop(x)
         x = self.norm_pre(x)
@@ -412,7 +489,17 @@ class SuperpixelVisionTransformer(VisionTransformer):
         attns = torch.stack(attns)
         return attns
     
-    def get_intermediate_features(self, x, spix_label):
+    def get_intermediate_features(self, x: torch.Tensor) -> torch.Tensor:
+        # Predict superpixel parameters
+        params = self.parameter_predictor(x)
+        K_pred = params["num_superpixels"]
+        m_pred = params["compactness"]
+        K = torch.clamp(K_pred, min=50, max=1000)
+        m = torch.clamp(m_pred, min=1, max=40)
+        if K.dim() > 1 and K.shape[1] == 1: K = K.squeeze(1)
+        if m.dim() > 1 and m.shape[1] == 1: m = m.squeeze(1)
+        spix_label = generate_superpixels(x, K, m).unsqueeze(1)
+        
         features = []
         x, mask = self.prepare_tokens(x, spix_label) # patch_embed and _pos_embed in once
         features.append(x)
@@ -428,73 +515,38 @@ class SuperpixelVisionTransformer(VisionTransformer):
 
 
 @register_model
-def suit_tiny_224(pretrained=False, **kwargs):
-    model = SuperpixelVisionTransformer(
+def suit_tiny_224_adaptive(pretrained=False, **kwargs):
+    model = SuitAdaptive(
         embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True, base_dim=48,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    # Pretrained weights are not available for adaptive models yet.
     if pretrained:
-        url="https://drive.google.com/uc?export=download&id=1Yvje-LLkHdeAo3RXrguzV-twNH2sn4Js"
-        output = "suit_tiny_224.pth"
-        if not os.path.exists(output):
-            print(f"{output} not found. Downloading from {url}...")
-            gdown.download(url, output, quiet=False)
-        else:
-            print(f"{output} already exists. Skipping download.")
-        checkpoint = torch.load(output)
-        model.load_state_dict(checkpoint["model"])
-
+        print("Warning: Pretrained weights are not available for suit_tiny_224_adaptive. Initializing from scratch.")
     return model
 
 @register_model
-def suit_small_224(pretrained=False, **kwargs):
-    model = SuperpixelVisionTransformer(
+def suit_small_224_adaptive(pretrained=False, **kwargs):
+    model = SuitAdaptive(
         embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True, base_dim=96,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     if pretrained:
-        url="https://drive.google.com/uc?export=download&id=1steBEtsFYnAtTyS29jJUb2DrsN_qQPPv"
-        output = "suit_small_224.pth"
-        if not os.path.exists(output):
-            print(f"{output} not found. Downloading from {url}...")
-            gdown.download(url, output, quiet=False)
-        else:
-            print(f"{output} already exists. Skipping download.")
-        checkpoint = torch.load(output)
-        model.load_state_dict(checkpoint["model"])
-
+        print("Warning: Pretrained weights are not available for suit_small_224_adaptive. Initializing from scratch.")
     return model
 
 @register_model
-def suit_base_224(pretrained=False, **kwargs):
-    model = SuperpixelVisionTransformer(
+def suit_base_224_adaptive(pretrained=False, **kwargs):
+    model = SuitAdaptive(
         embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True, base_dim=192,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     if pretrained:
-        url="https://drive.google.com/uc?export=download&id=1ZwS2Ig8YL3WjOWkqYJjzjiRSh1J_s0KW"
-        output = "suit_base_224.pth"
-        if not os.path.exists(output):
-            print(f"{output} not found. Downloading from {url}...")
-            gdown.download(url, output, quiet=False)
-        else:
-            print(f"{output} already exists. Skipping download.")
-        checkpoint = torch.load(output)
-        model.load_state_dict(checkpoint["model"])
-
+        print("Warning: Pretrained weights are not available for suit_base_224_adaptive. Initializing from scratch.")
     return model
 
 @register_model
-def suit_base_dino(pretrained=False, **kwargs):
-    model = SuperpixelVisionTransformer(
+def suit_base_dino_adaptive(pretrained=False, **kwargs):
+    model = SuitAdaptive(
         embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True, base_dim=192,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     if pretrained:
-        url="https://drive.google.com/uc?export=download&id=1jnr9WLEzyrv4AzKWT0U04PS6CBO9v0IH"
-        output = "suit_base_dino.pth"
-        if not os.path.exists(output):
-            print(f"{output} not found. Downloading from {url}...")
-            gdown.download(url, output, quiet=False)
-        else:
-            print(f"{output} already exists. Skipping download.")
-        checkpoint = torch.load(output)
-        model.load_state_dict(checkpoint["model"])
-
+        print("Warning: Pretrained weights are not available for suit_base_dino_adaptive. Initializing from scratch.")
     return model

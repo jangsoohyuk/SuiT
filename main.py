@@ -23,7 +23,8 @@ from engine import train_one_epoch, evaluate
 from samplers import RASampler
 from augment import new_data_aug_generator
 
-import suit
+import suit # Changed to import the consolidated suit.py
+# This ensures models registered in suit.py are available via timm.create_model
 
 import utils
 from torch.utils.tensorboard import SummaryWriter
@@ -37,8 +38,8 @@ def get_args_parser():
     parser.add_argument('--unscale-lr', action='store_true')
 
     # Model parameters
-    parser.add_argument('--model', default='suit_small', type=str, metavar='MODEL',
-                        help='Name of model to train')
+    parser.add_argument('--model', default='suit_small_224', type=str, metavar='MODEL', # Default updated to include size like others
+                        help='Name of model to train (e.g., suit_tiny_224, deit_small). "_adaptive" will be appended if using SUIT models.')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -179,9 +180,8 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     
     # SuiT parameters
-    parser.add_argument('--spix-method', default='fastslic', choices=['slic', 'fastslic'], help='Superpixel algorithm to use.')
-    parser.add_argument('--compactness', default=10, type=int, help='slic compactness parameter')
-    parser.add_argument('--n-spix-segments', type=int, default=196, help='number of superpixels to use per image.')
+    parser.add_argument('--spix-method', default='slic', choices=['slic', 'fastslic'], help='Superpixel algorithm to use. Currently, only slic is directly used by generate_superpixels.') # Default changed to slic
+    # --compactness and --n-spix-segments are removed as they are predicted by ParameterPredictor
     parser.add_argument('--downsample', type=int, default=2, help='downsampling scale factor be applied.')
     parser.add_argument('--aggregate', nargs='+', help='List of types to process', default=['max', 'avg'])
     parser.add_argument('--pe-type', default='ff', choices=['ff', 'pe'], type=str, help="position encoding method")
@@ -261,8 +261,14 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
+    
+    model_name = args.model
+    if 'suit' in args.model: # Append _adaptive for SUIT models
+        model_name = args.model + '_adaptive'
+        print(f"Updated model name to: {model_name} for SUIT adaptive model.")
+
     model = create_model(
-        args.model,
+        model_name,
         pretrained=False,
         num_classes=args.nb_classes,
         drop_rate=args.drop,

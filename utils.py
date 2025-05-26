@@ -13,6 +13,7 @@ import datetime
 
 import torch
 import torch.distributed as dist
+import numpy as np # For generate_superpixels
 
 
 class SmoothedValue(object):
@@ -236,3 +237,59 @@ def init_distributed_mode(args):
                                          world_size=args.world_size, rank=args.rank)
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
+
+# --- Content from utils/superpixels.py ---
+try:
+    from skimage.segmentation import slic
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    SKIMAGE_AVAILABLE = False
+    # We'll print a message within the function if skimage is needed but not available.
+
+def generate_superpixels(image_batch: torch.Tensor, K_batch: torch.Tensor, m_batch: torch.Tensor) -> torch.Tensor:
+    """
+    Generates superpixel maps for a batch of images using SLIC.
+
+    Args:
+        image_batch (torch.Tensor): A batch of images, shape [B, C, H, W].
+                                    Assumed to be in a range suitable for skimage.slic (e.g., float [0,1] or [0,255]).
+        K_batch (torch.Tensor): A tensor containing the number of superpixels for each image, shape [B].
+        m_batch (torch.Tensor): A tensor containing the compactness parameter for each image, shape [B].
+
+    Returns:
+        torch.Tensor: A batch of superpixel maps, shape [B, H, W].
+    """
+    if not SKIMAGE_AVAILABLE:
+        # Modified warning to be more direct for the user.
+        print("Warning: scikit-image is not installed. Superpixel generation functionality will be disabled. "
+              "Please install it using 'pip install scikit-image' to enable this feature.")
+        if image_batch is not None and image_batch.dim() == 4:
+            B, _, H, W = image_batch.shape
+            return torch.zeros((B, H, W), dtype=torch.long, device=image_batch.device)
+        else:
+            raise ImportError("scikit-image is not available and input image_batch is invalid for shape inference.")
+
+    batch_size = image_batch.shape[0]
+    superpixel_maps = []
+
+    for i in range(batch_size):
+        current_image_tensor = image_batch[i] # Shape: [C, H, W]
+        num_superpixels = int(K_batch[i].item())
+        compactness = float(m_batch[i].item()) # slic expects float for compactness
+        
+        if current_image_tensor.shape[0] == 1: # Grayscale
+            img_np = current_image_tensor.permute(1, 2, 0).cpu().numpy().squeeze(axis=-1)
+        else: # Color
+            img_np = current_image_tensor.permute(1, 2, 0).cpu().numpy()
+
+        img_np = np.ascontiguousarray(img_np)
+
+        # slic_zero=True ensures label 0 is not used, making segment labels start from 1.
+        # channel_axis=-1 for RGB, None for grayscale.
+        superpixel_map = slic(img_np, n_segments=num_superpixels, compactness=compactness,
+                              slic_zero=True, start_label=1, channel_axis=-1 if img_np.ndim == 3 else None) 
+        superpixel_maps.append(torch.from_numpy(superpixel_map))
+
+    batched_superpixel_maps = torch.stack(superpixel_maps, dim=0)
+    return batched_superpixel_maps.to(image_batch.device)
+# End of content from utils/superpixels.py (excluding its __main__ block)
